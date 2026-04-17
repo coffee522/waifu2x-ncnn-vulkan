@@ -5,6 +5,7 @@ env:
   VULKANSDK_VERSION: 1.4.309.0
   DEVELOPER_DIR: /Applications/Xcode_15.2.app/Contents/Developer
   UseMultiToolTask: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
   group: CI-${{ github.ref }}
