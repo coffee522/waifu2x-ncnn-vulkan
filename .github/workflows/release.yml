@@ -7,6 +7,9 @@ env:
   UseMultiToolTask: true
   APPLICATION_NAME: waifu2x-ncnn-vulkan
 
+permissions:
+  contents: read
+
 jobs:
 
   setup:
@@ -30,7 +33,7 @@ jobs:
     env:
       PACKAGENAME: ${{ needs.setup.outputs.APPNAME }}-${{ needs.setup.outputs.VERSION }}-ubuntu
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
       with:
         submodules: 'recursive'
     - name: build
@@ -57,13 +60,13 @@ jobs:
     steps:
     - name: cache-openmp
       id: cache-openmp
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: openmp-install
         key: openmp-macos-release-11.0.0
     - name: checkout
       if: steps.cache-openmp.outputs.cache-hit != 'true'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
     - name: openmp
       if: steps.cache-openmp.outputs.cache-hit != 'true'
       run: |
@@ -110,7 +113,7 @@ jobs:
     env:
       PACKAGENAME: ${{ needs.setup.outputs.APPNAME }}-${{ needs.setup.outputs.VERSION }}-macos
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
       with:
         submodules: 'recursive'
     - name: download-openmp-macos
@@ -170,7 +173,7 @@ jobs:
     env:
       PACKAGENAME: ${{ needs.setup.outputs.APPNAME }}-${{ needs.setup.outputs.VERSION }}-windows
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
       with:
         submodules: 'recursive'
     - name: build
@@ -196,6 +199,8 @@ jobs:
   release:
     needs: [setup, ubuntu, macos, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
     - name: download
       uses: actions/download-artifact@v8
