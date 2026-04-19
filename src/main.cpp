@@ -5,6 +5,7 @@
 #include <queue>
 #include <vector>
 #include <clocale>
+#include <string>
 
 #if _WIN32
 // image decoder and encoder with wic
@@ -100,11 +101,13 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 
 static void print_usage()
 {
-    fprintf(stdout, "Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...\n\n");
+    fprintf(stdout, "Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...\n");
+    fprintf(stdout, "       waifu2x-ncnn-vulkan -l listfile [options]...\n\n");
     fprintf(stdout, "  -h                   show this help\n");
     fprintf(stdout, "  -v                   verbose output\n");
     fprintf(stdout, "  -i input-path        input image path (jpg/png/webp) or directory\n");
     fprintf(stdout, "  -o output-path       output image path (jpg/png/webp) or directory\n");
+    fprintf(stdout, "  -l list-path         UTF-8 TSV file with one input-path<TAB>output-path pair per line\n");
     fprintf(stdout, "  -n noise-level       denoise level (-1/0/1/2/3, default=0)\n");
     fprintf(stdout, "  -s scale             upscale ratio (1/2/4/8/16/32, default=2)\n");
     fprintf(stdout, "  -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu\n");
@@ -113,6 +116,153 @@ static void print_usage()
     fprintf(stdout, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stdout, "  -x                   enable tta mode\n");
     fprintf(stdout, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
+}
+
+static int is_supported_output_extension(const path_t& path)
+{
+    path_t ext = get_file_extension(path);
+
+    if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+        return 1;
+
+    if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+        return 1;
+
+    if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
+        return 1;
+
+    return 0;
+}
+
+static int utf8_to_path(const std::string& text, path_t& path)
+{
+#if _WIN32
+    if (text.empty())
+    {
+        path.clear();
+        return 0;
+    }
+
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), (int)text.size(), 0, 0);
+    if (length <= 0)
+        return -1;
+
+    std::vector<wchar_t> buffer(length);
+    length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), (int)text.size(), &buffer[0], length);
+    if (length <= 0)
+        return -1;
+
+    path.assign(buffer.begin(), buffer.end());
+#else
+    path = text;
+#endif
+
+    return 0;
+}
+
+static int load_path_list(const path_t& listpath, std::vector<path_t>& input_files, std::vector<path_t>& output_files)
+{
+#if _WIN32
+    FILE* fp = _wfopen(listpath.c_str(), L"rb");
+#else
+    FILE* fp = fopen(listpath.c_str(), "rb");
+#endif
+    if (!fp)
+    {
+#if _WIN32
+        fwprintf(stderr, L"open list file %ls failed\n", listpath.c_str());
+#else
+        fprintf(stderr, "open list file %s failed\n", listpath.c_str());
+#endif
+        return -1;
+    }
+
+    std::string content;
+    char buffer[4096];
+    for (;;)
+    {
+        size_t bytes = fread(buffer, 1, sizeof(buffer), fp);
+        if (bytes > 0)
+            content.append(buffer, bytes);
+
+        if (bytes < sizeof(buffer))
+        {
+            if (ferror(fp))
+            {
+                fclose(fp);
+#if _WIN32
+                fwprintf(stderr, L"read list file %ls failed\n", listpath.c_str());
+#else
+                fprintf(stderr, "read list file %s failed\n", listpath.c_str());
+#endif
+                return -1;
+            }
+            break;
+        }
+    }
+    fclose(fp);
+
+    size_t pos = 0;
+    int line_number = 1;
+    while (pos <= content.size())
+    {
+        size_t end = content.find('\n', pos);
+        if (end == std::string::npos)
+            end = content.size();
+
+        std::string line = content.substr(pos, end - pos);
+        if (!line.empty() && line[line.size() - 1] == '\r')
+            line.resize(line.size() - 1);
+
+        if (line_number == 1 && line.size() >= 3
+                && (unsigned char)line[0] == 0xef
+                && (unsigned char)line[1] == 0xbb
+                && (unsigned char)line[2] == 0xbf)
+        {
+            line.erase(0, 3);
+        }
+
+        if (!line.empty() && line[0] != '#')
+        {
+            size_t tab = line.find('\t');
+            if (tab == std::string::npos || tab == 0 || tab == line.size() - 1 || line.find('\t', tab + 1) != std::string::npos)
+            {
+                fprintf(stderr, "invalid list file line %d\n", line_number);
+                return -1;
+            }
+
+            path_t inpath;
+            path_t outpath;
+            if (utf8_to_path(line.substr(0, tab), inpath) != 0 || utf8_to_path(line.substr(tab + 1), outpath) != 0)
+            {
+                fprintf(stderr, "invalid UTF-8 in list file line %d\n", line_number);
+                return -1;
+            }
+
+            if (!is_supported_output_extension(outpath))
+            {
+                fprintf(stderr, "invalid outputpath extension type in list file line %d\n", line_number);
+                return -1;
+            }
+
+            input_files.push_back(inpath);
+            output_files.push_back(outpath);
+        }
+
+        if (end == content.size())
+            break;
+
+        pos = end + 1;
+        line_number++;
+    }
+
+    if (input_files.empty())
+    {
+        fprintf(stderr, "list file has no input/output pairs\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 class Task
@@ -467,6 +617,7 @@ int main(int argc, char** argv)
 {
     path_t inputpath;
     path_t outputpath;
+    path_t listpath;
     int noise = 0;
     int scale = 2;
     std::vector<int> tilesize;
@@ -482,7 +633,7 @@ int main(int argc, char** argv)
 #if _WIN32
     setlocale(LC_ALL, "");
     wchar_t opt;
-    while ((opt = getopt(argc, argv, L"i:o:n:s:t:m:g:j:f:vxh")) != (wchar_t)-1)
+    while ((opt = getopt(argc, argv, L"i:o:l:n:s:t:m:g:j:f:vxh")) != (wchar_t)-1)
     {
         switch (opt)
         {
@@ -491,6 +642,9 @@ int main(int argc, char** argv)
             break;
         case L'o':
             outputpath = optarg;
+            break;
+        case L'l':
+            listpath = optarg;
             break;
         case L'n':
             noise = _wtoi(optarg);
@@ -528,7 +682,7 @@ int main(int argc, char** argv)
     }
 #else // _WIN32
     int opt;
-    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:vxh")) != -1)
+    while ((opt = getopt(argc, argv, "i:o:l:n:s:t:m:g:j:f:vxh")) != -1)
     {
         switch (opt)
         {
@@ -537,6 +691,9 @@ int main(int argc, char** argv)
             break;
         case 'o':
             outputpath = optarg;
+            break;
+        case 'l':
+            listpath = optarg;
             break;
         case 'n':
             noise = atoi(optarg);
@@ -574,7 +731,13 @@ int main(int argc, char** argv)
     }
 #endif // _WIN32
 
-    if (inputpath.empty() || outputpath.empty())
+    if (!listpath.empty() && (!inputpath.empty() || !outputpath.empty()))
+    {
+        fprintf(stderr, "list file mode cannot be used with inputpath or outputpath\n");
+        return -1;
+    }
+
+    if (listpath.empty() && (inputpath.empty() || outputpath.empty()))
     {
         print_usage();
         return -1;
@@ -628,7 +791,7 @@ int main(int argc, char** argv)
         }
     }
 
-    if (!path_is_directory(outputpath))
+    if (listpath.empty() && !path_is_directory(outputpath))
     {
         // guess format from outputpath no matter what format argument specified
         path_t ext = get_file_extension(outputpath);
@@ -662,7 +825,13 @@ int main(int argc, char** argv)
     std::vector<path_t> input_files;
     std::vector<path_t> output_files;
     {
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
+        if (!listpath.empty())
+        {
+            int lr = load_path_list(listpath, input_files, output_files);
+            if (lr != 0)
+                return -1;
+        }
+        else if (path_is_directory(inputpath) && path_is_directory(outputpath))
         {
             std::vector<path_t> filenames;
             int lr = list_directory(inputpath, filenames);
@@ -855,7 +1024,7 @@ int main(int argc, char** argv)
 
         uint32_t heap_budget = ncnn::get_gpu_device(gpuid[i])->get_heap_budget();
 
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
+        if (input_files.size() > 1)
         {
             // multiple gpu jobs share the same heap
             heap_budget /= jobs_proc_per_gpu[gpuid[i]];

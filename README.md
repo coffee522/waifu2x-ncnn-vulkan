@@ -27,11 +27,13 @@ waifu2x-ncnn-vulkan.exe -i input.jpg -o output.png -n 2 -s 2
 
 ```console
 Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...
+       waifu2x-ncnn-vulkan -l listfile [options]...
 
   -h                   show this help
   -v                   verbose output
   -i input-path        input image path (jpg/png/webp) or directory
   -o output-path       output image path (jpg/png/webp) or directory
+  -l list-path         UTF-8 TSV file with one input-path<TAB>output-path pair per line
   -n noise-level       denoise level (-1/0/1/2/3, default=0)
   -s scale             upscale ratio (1/2/4/8/16/32, default=2)
   -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu
@@ -43,6 +45,7 @@ Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...
 ```
 
 - `input-path` and `output-path` accept either file path or directory path
+- `list-path` is a UTF-8 tab-separated file. Each non-empty, non-comment line must contain one input image path and one output image path separated by a single tab. The program does not create output directories for list entries.
 - `noise-level` = noise level, large value means strong denoise effect, -1 = no effect
 - `scale` = scale level, 1 = no scaling, 2 = upscale 2x
 - `tile-size` = tile size, use smaller value to reduce GPU memory usage, default selects automatically
