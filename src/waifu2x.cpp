@@ -30,8 +30,11 @@ Waifu2x::~Waifu2x()
         delete waifu2x_postproc;
     }
 
-    bicubic_2x->destroy_pipeline(net.opt);
-    delete bicubic_2x;
+    if (bicubic_2x)
+    {
+        bicubic_2x->destroy_pipeline(net.opt);
+        delete bicubic_2x;
+    }
 }
 
 #if _WIN32
@@ -46,7 +49,8 @@ int Waifu2x::load(const std::string& parampath, const std::string& modelpath)
     net.opt.use_fp16_arithmetic = false;
     net.opt.use_int8_storage = true;
 
-    net.set_vulkan_device(vkdev);
+    if (vkdev)
+        net.set_vulkan_device(vkdev);
 
 #if _WIN32
     {
@@ -54,26 +58,46 @@ int Waifu2x::load(const std::string& parampath, const std::string& modelpath)
         if (!fp)
         {
             fwprintf(stderr, L"_wfopen %ls failed\n", parampath.c_str());
+            return -1;
         }
 
-        net.load_param(fp);
+        int ret = net.load_param(fp);
 
         fclose(fp);
+        if (ret != 0)
+        {
+            fwprintf(stderr, L"load param %ls failed\n", parampath.c_str());
+            return -1;
+        }
     }
     {
         FILE* fp = _wfopen(modelpath.c_str(), L"rb");
         if (!fp)
         {
             fwprintf(stderr, L"_wfopen %ls failed\n", modelpath.c_str());
+            return -1;
         }
 
-        net.load_model(fp);
+        int ret = net.load_model(fp);
 
         fclose(fp);
+        if (ret != 0)
+        {
+            fwprintf(stderr, L"load model %ls failed\n", modelpath.c_str());
+            return -1;
+        }
     }
 #else
-    net.load_param(parampath.c_str());
-    net.load_model(modelpath.c_str());
+    if (net.load_param(parampath.c_str()) != 0)
+    {
+        fprintf(stderr, "load param %s failed\n", parampath.c_str());
+        return -1;
+    }
+    if (net.load_model(modelpath.c_str()) != 0)
+    {
+        fprintf(stderr, "load model %s failed\n", modelpath.c_str());
+        return -1;
+    }
 #endif
 
     // initialize preprocess and postprocess pipeline
@@ -161,11 +185,15 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
     const int h = inimage.h;
     const int channels = inimage.elempack;
 
+    if (!pixeldata || w <= 0 || h <= 0 || (channels != 3 && channels != 4) || tilesize <= 0 || outimage.empty())
+        return -1;
+
     const int TILE_SIZE_X = tilesize;
     const int TILE_SIZE_Y = tilesize;
 
     ncnn::VkAllocator* blob_vkallocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* staging_vkallocator = vkdev->acquire_staging_allocator();
+    int ret = 0;
 
     ncnn::Option opt = net.opt;
     opt.blob_vkallocator = blob_vkallocator;
@@ -230,7 +258,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0)
+                {
+                    ret = -1;
+                    goto CLEANUP;
+                }
                 cmd.reset();
             }
         }
@@ -333,9 +365,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                     ex.set_workspace_vkallocator(blob_vkallocator);
                     ex.set_staging_vkallocator(staging_vkallocator);
 
-                    ex.input("Input1", in_tile_gpu[ti]);
-
-                    ex.extract("Eltwise4", out_tile_gpu[ti], cmd);
+                    if (ex.input("Input1", in_tile_gpu[ti]) != 0 || ex.extract("Eltwise4", out_tile_gpu[ti], cmd) != 0)
+                    {
+                        ret = -1;
+                        goto CLEANUP;
+                    }
                 }
 
                 ncnn::VkMat out_alpha_tile_gpu;
@@ -347,7 +381,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                     }
                     if (scale == 2)
                     {
-                        bicubic_2x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+                        if (bicubic_2x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt) != 0)
+                        {
+                            ret = -1;
+                            goto CLEANUP;
+                        }
                     }
                 }
 
@@ -442,9 +480,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                     ex.set_workspace_vkallocator(blob_vkallocator);
                     ex.set_staging_vkallocator(staging_vkallocator);
 
-                    ex.input("Input1", in_tile_gpu);
-
-                    ex.extract("Eltwise4", out_tile_gpu, cmd);
+                    if (ex.input("Input1", in_tile_gpu) != 0 || ex.extract("Eltwise4", out_tile_gpu, cmd) != 0)
+                    {
+                        ret = -1;
+                        goto CLEANUP;
+                    }
                 }
 
                 ncnn::VkMat out_alpha_tile_gpu;
@@ -456,7 +496,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                     }
                     if (scale == 2)
                     {
-                        bicubic_2x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+                        if (bicubic_2x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt) != 0)
+                        {
+                            ret = -1;
+                            goto CLEANUP;
+                        }
                     }
                 }
 
@@ -491,7 +535,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0)
+                {
+                    ret = -1;
+                    goto CLEANUP;
+                }
                 cmd.reset();
             }
         }
@@ -507,7 +555,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
 
             cmd.record_clone(out_gpu, out, opt);
 
-            cmd.submit_and_wait();
+            if (cmd.submit_and_wait() != 0)
+            {
+                ret = -1;
+                goto CLEANUP;
+            }
 
             if (!(opt.use_fp16_storage && opt.use_int8_storage))
             {
@@ -531,10 +583,11 @@ int Waifu2x::process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
         }
     }
 
+CLEANUP:
     vkdev->reclaim_blob_allocator(blob_vkallocator);
     vkdev->reclaim_staging_allocator(staging_vkallocator);
 
-    return 0;
+    return ret;
 }
 
 int Waifu2x::process_cpu(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
@@ -549,6 +602,9 @@ int Waifu2x::process_cpu(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
     const int w = inimage.w;
     const int h = inimage.h;
     const int channels = inimage.elempack;
+
+    if (!pixeldata || w <= 0 || h <= 0 || (channels != 3 && channels != 4) || tilesize <= 0 || outimage.empty())
+        return -1;
 
     const int TILE_SIZE_X = tilesize;
     const int TILE_SIZE_Y = tilesize;
@@ -712,9 +768,8 @@ int Waifu2x::process_cpu(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                 {
                     ncnn::Extractor ex = net.create_extractor();
 
-                    ex.input("Input1", in_tile[ti]);
-
-                    ex.extract("Eltwise4", out_tile[ti]);
+                    if (ex.input("Input1", in_tile[ti]) != 0 || ex.extract("Eltwise4", out_tile[ti]) != 0)
+                        return -1;
                 }
 
                 ncnn::Mat out_alpha_tile;
@@ -726,7 +781,8 @@ int Waifu2x::process_cpu(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                     }
                     if (scale == 2)
                     {
-                        bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        if (bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt) != 0)
+                            return -1;
                     }
                 }
 
@@ -813,9 +869,8 @@ int Waifu2x::process_cpu(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                 {
                     ncnn::Extractor ex = net.create_extractor();
 
-                    ex.input("Input1", in_tile);
-
-                    ex.extract("Eltwise4", out_tile);
+                    if (ex.input("Input1", in_tile) != 0 || ex.extract("Eltwise4", out_tile) != 0)
+                        return -1;
                 }
 
                 ncnn::Mat out_alpha_tile;
@@ -827,7 +882,8 @@ int Waifu2x::process_cpu(const ncnn::Mat& inimage, ncnn::Mat& outimage) const
                     }
                     if (scale == 2)
                     {
-                        bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        if (bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt) != 0)
+                            return -1;
                     }
                 }
 

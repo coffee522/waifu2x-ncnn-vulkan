@@ -1,9 +1,13 @@
+cmake_minimum_required(VERSION 3.10)
+
 cmake_policy(SET CMP0091 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 project(waifu2x-ncnn-vulkan)
-cmake_minimum_required(VERSION 3.10)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE release CACHE STRING "Choose the type of build" FORCE)
@@ -191,7 +195,7 @@ if(NOT USE_SYSTEM_NCNN)
     option(WITH_LAYER_mish "" OFF)
     option(WITH_LAYER_statisticspooling "" OFF)
     option(WITH_LAYER_swish "" OFF)
-    option(WITH_LAYER_gemm "" OFF)
+    option(WITH_LAYER_gemm "" ON)
     option(WITH_LAYER_groupnorm "" OFF)
     option(WITH_LAYER_layernorm "" OFF)
     option(WITH_LAYER_softplus "" OFF)
@@ -273,7 +277,7 @@ if(MINGW)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -municode")
 endif()
 
-add_executable(waifu2x-ncnn-vulkan main.cpp waifu2x.cpp)
+add_executable(waifu2x-ncnn-vulkan main.cpp waifu2x.cpp webp_encoder.cpp)
 
 add_dependencies(waifu2x-ncnn-vulkan generate-spirv)
 

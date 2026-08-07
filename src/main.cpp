@@ -2,7 +2,11 @@
 
 #include <stdio.h>
 #include <algorithm>
+#include <atomic>
+#include <limits.h>
 #include <queue>
+#include <set>
+#include <string>
 #include <vector>
 #include <clocale>
 
@@ -19,10 +23,9 @@
 #define STBI_NO_PIC
 #define STBI_NO_STDIO
 #include "stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 #endif // _WIN32
 #include "webp_image.h"
+#include "webp_encoder.h"
 
 #if _WIN32
 #include <wchar.h>
@@ -69,6 +72,19 @@ static std::vector<int> parse_optarg_int_array(const wchar_t* optarg)
 
     return array;
 }
+
+static int parse_jobs_argument(const wchar_t* argument, int& jobs_load, std::vector<int>& jobs_proc, int& jobs_save)
+{
+    const wchar_t* first = wcschr(argument, L':');
+    const wchar_t* second = first ? wcschr(first + 1, L':') : 0;
+    if (!first || !second || first == argument || second == first + 1 || second[1] == L'\0' || wcschr(second + 1, L':'))
+        return -1;
+
+    jobs_load = _wtoi(argument);
+    jobs_proc = parse_optarg_int_array(first + 1);
+    jobs_save = _wtoi(second + 1);
+    return 0;
+}
 #else // _WIN32
 #include <unistd.h> // getopt()
 
@@ -87,6 +103,19 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 
     return array;
 }
+
+static int parse_jobs_argument(const char* argument, int& jobs_load, std::vector<int>& jobs_proc, int& jobs_save)
+{
+    const char* first = strchr(argument, ':');
+    const char* second = first ? strchr(first + 1, ':') : 0;
+    if (!first || !second || first == argument || second == first + 1 || second[1] == '\0' || strchr(second + 1, ':'))
+        return -1;
+
+    jobs_load = atoi(argument);
+    jobs_proc = parse_optarg_int_array(first + 1);
+    jobs_save = atoi(second + 1);
+    return 0;
+}
 #endif // _WIN32
 
 // ncnn
@@ -100,11 +129,13 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 
 static void print_usage()
 {
-    fprintf(stdout, "Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...\n\n");
+    fprintf(stdout, "Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...\n");
+    fprintf(stdout, "       waifu2x-ncnn-vulkan -l listfile [options]...\n\n");
     fprintf(stdout, "  -h                   show this help\n");
     fprintf(stdout, "  -v                   verbose output\n");
     fprintf(stdout, "  -i input-path        input image path (jpg/png/webp) or directory\n");
-    fprintf(stdout, "  -o output-path       output image path (jpg/png/webp) or directory\n");
+    fprintf(stdout, "  -o output-path       output WebP image path or directory\n");
+    fprintf(stdout, "  -l list-path         UTF-8 TSV with input-path<TAB>output-webp-path per line\n");
     fprintf(stdout, "  -n noise-level       denoise level (-1/0/1/2/3, default=0)\n");
     fprintf(stdout, "  -s scale             upscale ratio (1/2/4/8/16/32, default=2)\n");
     fprintf(stdout, "  -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu\n");
@@ -112,14 +143,236 @@ static void print_usage()
     fprintf(stdout, "  -g gpu-id            gpu device to use (-1=cpu, default=auto) can be 0,1,2 for multi-gpu\n");
     fprintf(stdout, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stdout, "  -x                   enable tta mode\n");
-    fprintf(stdout, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
+    fprintf(stdout, "\nWebP settings are fixed: quality=85 method=2 lossless=0 thread_level=0\n");
 }
+
+static int is_supported_input_path(const path_t& path)
+{
+    path_t ext = get_file_extension(path);
+    return ext == PATHSTR("jpg") || ext == PATHSTR("JPG")
+        || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")
+        || ext == PATHSTR("png") || ext == PATHSTR("PNG")
+        || ext == PATHSTR("webp") || ext == PATHSTR("WEBP");
+}
+
+static int is_webp_output_path(const path_t& path)
+{
+    path_t ext = get_file_extension(path);
+    return ext == PATHSTR("webp") || ext == PATHSTR("WEBP");
+}
+
+static int utf8_to_path(const std::string& text, path_t& path)
+{
+#if _WIN32
+    if (text.empty())
+    {
+        path.clear();
+        return 0;
+    }
+
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), (int)text.size(), 0, 0);
+    if (length <= 0)
+        return -1;
+
+    std::vector<wchar_t> buffer(length);
+    length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.c_str(), (int)text.size(), &buffer[0], length);
+    if (length <= 0)
+        return -1;
+
+    path.assign(buffer.begin(), buffer.end());
+#else
+    path = text;
+#endif
+
+    return 0;
+}
+
+static int load_path_list(const path_t& listpath, std::vector<path_t>& input_files, std::vector<path_t>& output_files)
+{
+#if _WIN32
+    FILE* fp = _wfopen(listpath.c_str(), L"rb");
+#else
+    FILE* fp = fopen(listpath.c_str(), "rb");
+#endif
+    if (!fp)
+    {
+#if _WIN32
+        fwprintf(stderr, L"open list file %ls failed\n", listpath.c_str());
+#else
+        fprintf(stderr, "open list file %s failed\n", listpath.c_str());
+#endif
+        return -1;
+    }
+
+    std::string content;
+    char buffer[4096];
+    for (;;)
+    {
+        size_t bytes = fread(buffer, 1, sizeof(buffer), fp);
+        if (bytes > 0)
+            content.append(buffer, bytes);
+
+        if (bytes < sizeof(buffer))
+        {
+            if (ferror(fp))
+            {
+                fclose(fp);
+                fprintf(stderr, "read list file failed\n");
+                return -1;
+            }
+            break;
+        }
+    }
+    fclose(fp);
+
+    size_t pos = 0;
+    int line_number = 1;
+    while (pos <= content.size())
+    {
+        size_t end = content.find('\n', pos);
+        if (end == std::string::npos)
+            end = content.size();
+
+        std::string line = content.substr(pos, end - pos);
+        if (!line.empty() && line[line.size() - 1] == '\r')
+            line.resize(line.size() - 1);
+
+        if (line_number == 1 && line.size() >= 3
+                && (unsigned char)line[0] == 0xef
+                && (unsigned char)line[1] == 0xbb
+                && (unsigned char)line[2] == 0xbf)
+        {
+            line.erase(0, 3);
+        }
+
+        if (!line.empty() && line[0] != '#')
+        {
+            size_t tab = line.find('\t');
+            if (tab == std::string::npos || tab == 0 || tab == line.size() - 1 || line.find('\t', tab + 1) != std::string::npos)
+            {
+                fprintf(stderr, "invalid list file line %d\n", line_number);
+                return -1;
+            }
+
+            path_t input_path;
+            path_t output_path;
+            if (utf8_to_path(line.substr(0, tab), input_path) != 0 || utf8_to_path(line.substr(tab + 1), output_path) != 0)
+            {
+                fprintf(stderr, "invalid UTF-8 in list file line %d\n", line_number);
+                return -1;
+            }
+            if (!is_supported_input_path(input_path))
+            {
+                fprintf(stderr, "unsupported input extension in list file line %d\n", line_number);
+                return -1;
+            }
+            if (!is_webp_output_path(output_path))
+            {
+                fprintf(stderr, "output path must use .webp in list file line %d\n", line_number);
+                return -1;
+            }
+
+            input_files.push_back(input_path);
+            output_files.push_back(output_path);
+        }
+
+        if (end == content.size())
+            break;
+
+        pos = end + 1;
+        line_number++;
+    }
+
+    if (input_files.empty())
+    {
+        fprintf(stderr, "list file has no input/output pairs\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_paths(const std::vector<path_t>& input_files, const std::vector<path_t>& output_files)
+{
+    if (input_files.empty() || input_files.size() != output_files.size())
+    {
+        fprintf(stderr, "input/output file list is empty or mismatched\n");
+        return -1;
+    }
+
+    std::set<path_t> unique_outputs;
+    for (size_t i = 0; i < input_files.size(); i++)
+    {
+        const path_t& input_path = input_files[i];
+        const path_t& output_path = output_files[i];
+        const path_t temporary_path = webp_temporary_path(output_path);
+
+        if (!is_supported_input_path(input_path) || path_is_directory(input_path) || !filepath_is_readable(input_path))
+        {
+#if _WIN32
+            fwprintf(stderr, L"input image is missing or unreadable: %ls\n", input_path.c_str());
+#else
+            fprintf(stderr, "input image is missing or unreadable: %s\n", input_path.c_str());
+#endif
+            return -1;
+        }
+        if (!is_webp_output_path(output_path))
+        {
+            fprintf(stderr, "all output files must use .webp\n");
+            return -1;
+        }
+        if (!path_is_directory(get_parent_directory(output_path)))
+        {
+#if _WIN32
+            fwprintf(stderr, L"output parent directory does not exist: %ls\n", get_parent_directory(output_path).c_str());
+#else
+            fprintf(stderr, "output parent directory does not exist: %s\n", get_parent_directory(output_path).c_str());
+#endif
+            return -1;
+        }
+        if (path_exists(output_path) || path_exists(temporary_path))
+        {
+#if _WIN32
+            fwprintf(stderr, L"output or temporary output already exists: %ls\n", output_path.c_str());
+#else
+            fprintf(stderr, "output or temporary output already exists: %s\n", output_path.c_str());
+#endif
+            return -1;
+        }
+        if (!unique_outputs.insert(output_path).second)
+        {
+#if _WIN32
+            fwprintf(stderr, L"duplicate output path: %ls\n", output_path.c_str());
+#else
+            fprintf(stderr, "duplicate output path: %s\n", output_path.c_str());
+#endif
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+class JobStatus
+{
+public:
+    explicit JobStatus(int expected_count)
+        : expected(expected_count), loaded(0), processed(0), encoded(0), failed(0)
+    {
+    }
+
+    const int expected;
+    std::atomic<int> loaded;
+    std::atomic<int> processed;
+    std::atomic<int> encoded;
+    std::atomic<int> failed;
+};
 
 class Task
 {
 public:
     int id;
-    int webp;
+    int input_is_webp;
     int scale;
 
     path_t inpath;
@@ -178,11 +431,67 @@ private:
 TaskQueue toproc;
 TaskQueue tosave;
 
+static void release_input_pixels(Task& task)
+{
+    unsigned char* pixeldata = (unsigned char*)task.inimage.data;
+    if (!pixeldata)
+        return;
+
+    if (task.input_is_webp == 1)
+    {
+        free(pixeldata);
+    }
+    else
+    {
+#if _WIN32
+        free(pixeldata);
+#else
+        stbi_image_free(pixeldata);
+#endif
+    }
+
+    task.inimage = ncnn::Mat();
+}
+
+static unsigned char* read_file_bytes(const path_t& path, int& length)
+{
+    length = 0;
+
+#if _WIN32
+    FILE* fp = _wfopen(path.c_str(), L"rb");
+#else
+    FILE* fp = fopen(path.c_str(), "rb");
+#endif
+    if (!fp)
+        return 0;
+
+    unsigned char* data = 0;
+    if (fseek(fp, 0, SEEK_END) == 0)
+    {
+        long file_length = ftell(fp);
+        if (file_length > 0 && file_length <= INT_MAX && fseek(fp, 0, SEEK_SET) == 0)
+        {
+            length = (int)file_length;
+            data = (unsigned char*)malloc(length);
+            if (data && fread(data, 1, length, fp) != (size_t)length)
+            {
+                free(data);
+                data = 0;
+                length = 0;
+            }
+        }
+    }
+
+    fclose(fp);
+    return data;
+}
+
 class LoadThreadParams
 {
 public:
     int scale;
     int jobs_load;
+    JobStatus* status;
 
     // session data
     std::vector<path_t> input_files;
@@ -192,104 +501,88 @@ public:
 void* load(void* args)
 {
     const LoadThreadParams* ltp = (const LoadThreadParams*)args;
-    const int count = ltp->input_files.size();
+    const int count = (int)ltp->input_files.size();
     const int scale = ltp->scale;
+    JobStatus* status = ltp->status;
 
     #pragma omp parallel for schedule(static,1) num_threads(ltp->jobs_load)
     for (int i=0; i<count; i++)
     {
         const path_t& imagepath = ltp->input_files[i];
 
-        int webp = 0;
+        int input_is_webp = 0;
 
         unsigned char* pixeldata = 0;
-        int w;
-        int h;
-        int c;
+        int w = 0;
+        int h = 0;
+        int c = 0;
 
 #if _WIN32
-        FILE* fp = _wfopen(imagepath.c_str(), L"rb");
-#else
-        FILE* fp = fopen(imagepath.c_str(), "rb");
-#endif
-        if (fp)
+        path_t extension = get_file_extension(imagepath);
+        if (extension == PATHSTR("webp") || extension == PATHSTR("WEBP"))
         {
-            // read whole file
-            unsigned char* filedata = 0;
             int length = 0;
-            {
-                fseek(fp, 0, SEEK_END);
-                length = ftell(fp);
-                rewind(fp);
-                filedata = (unsigned char*)malloc(length);
-                if (filedata)
-                {
-                    fread(filedata, 1, length, fp);
-                }
-                fclose(fp);
-            }
-
+            unsigned char* filedata = read_file_bytes(imagepath, length);
             if (filedata)
             {
                 pixeldata = webp_load(filedata, length, &w, &h, &c);
-                if (pixeldata)
-                {
-                    webp = 1;
-                }
-                else
-                {
-                    // not webp, try jpg png etc.
-#if _WIN32
-                    pixeldata = wic_decode_image(imagepath.c_str(), &w, &h, &c);
-#else // _WIN32
-                    pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 0);
-                    if (pixeldata)
-                    {
-                        // stb_image auto channel
-                        if (c == 1)
-                        {
-                            // grayscale -> rgb
-                            stbi_image_free(pixeldata);
-                            pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 3);
-                            c = 3;
-                        }
-                        else if (c == 2)
-                        {
-                            // grayscale + alpha -> rgba
-                            stbi_image_free(pixeldata);
-                            pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 4);
-                            c = 4;
-                        }
-                    }
-#endif // _WIN32
-                }
-
                 free(filedata);
+                if (pixeldata)
+                    input_is_webp = 1;
             }
         }
+        else
+        {
+            pixeldata = wic_decode_image(imagepath.c_str(), &w, &h, &c);
+        }
+#else
+        int length = 0;
+        unsigned char* filedata = read_file_bytes(imagepath, length);
+        if (filedata)
+        {
+            pixeldata = webp_load(filedata, length, &w, &h, &c);
+            if (pixeldata)
+            {
+                input_is_webp = 1;
+            }
+            else
+            {
+                pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 0);
+                if (pixeldata)
+                {
+                    // stb_image auto channel
+                    if (c == 1)
+                    {
+                        // grayscale -> rgb
+                        stbi_image_free(pixeldata);
+                        pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 3);
+                        c = 3;
+                    }
+                    else if (c == 2)
+                    {
+                        // grayscale + alpha -> rgba
+                        stbi_image_free(pixeldata);
+                        pixeldata = stbi_load_from_memory(filedata, length, &w, &h, &c, 4);
+                        c = 4;
+                    }
+                }
+            }
+
+            free(filedata);
+        }
+#endif
         if (pixeldata)
         {
             Task v;
             v.id = i;
-            v.webp = webp;
+            v.input_is_webp = input_is_webp;
             v.scale = scale;
             v.inpath = imagepath;
             v.outpath = ltp->output_files[i];
 
             v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
 
-            path_t ext = get_file_extension(v.outpath);
-            if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
-            {
-                path_t output_filename2 = ltp->output_files[i] + PATHSTR(".png");
-                v.outpath = output_filename2;
-#if _WIN32
-                fwprintf(stderr, L"image %ls has alpha channel ! %ls will output %ls\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
-#else // _WIN32
-                fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
-#endif // _WIN32
-            }
-
+            status->loaded.fetch_add(1);
             toproc.put(v);
         }
         else
@@ -299,6 +592,7 @@ void* load(void* args)
 #else // _WIN32
             fprintf(stderr, "decode image %s failed\n", imagepath.c_str());
 #endif // _WIN32
+            status->failed.fetch_add(1);
         }
     }
 
@@ -309,12 +603,14 @@ class ProcThreadParams
 {
 public:
     const Waifu2x* waifu2x;
+    JobStatus* status;
 };
 
 void* proc(void* args)
 {
     const ProcThreadParams* ptp = (const ProcThreadParams*)args;
     const Waifu2x* waifu2x = ptp->waifu2x;
+    JobStatus* status = ptp->status;
 
     for (;;)
     {
@@ -326,47 +622,45 @@ void* proc(void* args)
             break;
 
         const int scale = v.scale;
+        bool success = true;
         if (scale == 1)
         {
             v.outimage = ncnn::Mat(v.inimage.w, v.inimage.h, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
-            waifu2x->process(v.inimage, v.outimage);
+            success = !v.outimage.empty() && waifu2x->process(v.inimage, v.outimage) == 0;
+        }
+        else
+        {
+            int scale_run_count = 0;
+            if (scale == 2) scale_run_count = 1;
+            if (scale == 4) scale_run_count = 2;
+            if (scale == 8) scale_run_count = 3;
+            if (scale == 16) scale_run_count = 4;
+            if (scale == 32) scale_run_count = 5;
 
-            tosave.put(v);
+            v.outimage = ncnn::Mat(v.inimage.w * 2, v.inimage.h * 2, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
+            success = !v.outimage.empty() && waifu2x->process(v.inimage, v.outimage) == 0;
+
+            for (int i = 1; success && i < scale_run_count; i++)
+            {
+                ncnn::Mat tmp = v.outimage;
+                v.outimage = ncnn::Mat(tmp.w * 2, tmp.h * 2, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
+                success = !v.outimage.empty() && waifu2x->process(tmp, v.outimage) == 0;
+            }
+        }
+
+        if (!success)
+        {
+#if _WIN32
+            fwprintf(stderr, L"process image %ls failed\n", v.inpath.c_str());
+#else
+            fprintf(stderr, "process image %s failed\n", v.inpath.c_str());
+#endif
+            status->failed.fetch_add(1);
+            release_input_pixels(v);
             continue;
         }
 
-        int scale_run_count = 0;
-        if (scale == 2)
-        {
-            scale_run_count = 1;
-        }
-        if (scale == 4)
-        {
-            scale_run_count = 2;
-        }
-        if (scale == 8)
-        {
-            scale_run_count = 3;
-        }
-        if (scale == 16)
-        {
-            scale_run_count = 4;
-        }
-        if (scale == 32)
-        {
-            scale_run_count = 5;
-        }
-
-        v.outimage = ncnn::Mat(v.inimage.w * 2, v.inimage.h * 2, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
-        waifu2x->process(v.inimage, v.outimage);
-
-        for (int i = 1; i < scale_run_count; i++)
-        {
-            ncnn::Mat tmp = v.outimage;
-            v.outimage = ncnn::Mat(tmp.w * 2, tmp.h * 2, (size_t)v.inimage.elemsize, (int)v.inimage.elemsize);
-            waifu2x->process(tmp, v.outimage);
-        }
-
+        status->processed.fetch_add(1);
         tosave.put(v);
     }
 
@@ -377,12 +671,14 @@ class SaveThreadParams
 {
 public:
     int verbose;
+    JobStatus* status;
 };
 
 void* save(void* args)
 {
     const SaveThreadParams* stp = (const SaveThreadParams*)args;
     const int verbose = stp->verbose;
+    JobStatus* status = stp->status;
 
     for (;;)
     {
@@ -393,49 +689,14 @@ void* save(void* args)
         if (v.id == -233)
             break;
 
-        // free input pixel data
-        {
-            unsigned char* pixeldata = (unsigned char*)v.inimage.data;
-            if (v.webp == 1)
-            {
-                free(pixeldata);
-            }
-            else
-            {
-#if _WIN32
-                free(pixeldata);
-#else
-                stbi_image_free(pixeldata);
-#endif
-            }
-        }
+        std::string error;
+        bool success = encode_webp_file(v.outpath, v.outimage.w, v.outimage.h,
+                                        v.outimage.elempack, (const unsigned char*)v.outimage.data, error);
+        release_input_pixels(v);
 
-        int success = 0;
-
-        path_t ext = get_file_extension(v.outpath);
-
-        if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-        {
-            success = webp_save(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, (const unsigned char*)v.outimage.data);
-        }
-        else if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-        {
-#if _WIN32
-            success = wic_encode_image(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data);
-#else
-            success = stbi_write_png(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data, 0);
-#endif
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-#if _WIN32
-            success = wic_encode_jpeg_image(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data);
-#else
-            success = stbi_write_jpg(v.outpath.c_str(), v.outimage.w, v.outimage.h, v.outimage.elempack, v.outimage.data, 100);
-#endif
-        }
         if (success)
         {
+            status->encoded.fetch_add(1);
             if (verbose)
             {
 #if _WIN32
@@ -448,10 +709,11 @@ void* save(void* args)
         else
         {
 #if _WIN32
-            fwprintf(stderr, L"encode image %ls failed\n", v.outpath.c_str());
+            fwprintf(stderr, L"encode image %ls failed: %hs\n", v.outpath.c_str(), error.c_str());
 #else
-            fprintf(stderr, "encode image %s failed\n", v.outpath.c_str());
+            fprintf(stderr, "encode image %s failed: %s\n", v.outpath.c_str(), error.c_str());
 #endif
+            status->failed.fetch_add(1);
         }
     }
 
@@ -467,6 +729,7 @@ int main(int argc, char** argv)
 {
     path_t inputpath;
     path_t outputpath;
+    path_t listpath;
     int noise = 0;
     int scale = 2;
     std::vector<int> tilesize;
@@ -477,12 +740,11 @@ int main(int argc, char** argv)
     int jobs_save = 2;
     int verbose = 0;
     int tta_mode = 0;
-    path_t format = PATHSTR("png");
 
 #if _WIN32
     setlocale(LC_ALL, "");
     wchar_t opt;
-    while ((opt = getopt(argc, argv, L"i:o:n:s:t:m:g:j:f:vxh")) != (wchar_t)-1)
+    while ((opt = getopt(argc, argv, L"i:o:l:n:s:t:m:g:j:vxh")) != (wchar_t)-1)
     {
         switch (opt)
         {
@@ -491,6 +753,9 @@ int main(int argc, char** argv)
             break;
         case L'o':
             outputpath = optarg;
+            break;
+        case L'l':
+            listpath = optarg;
             break;
         case L'n':
             noise = _wtoi(optarg);
@@ -508,11 +773,11 @@ int main(int argc, char** argv)
             gpuid = parse_optarg_int_array(optarg);
             break;
         case L'j':
-            swscanf(optarg, L"%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
-            break;
-        case L'f':
-            format = optarg;
+            if (parse_jobs_argument(optarg, jobs_load, jobs_proc, jobs_save) != 0)
+            {
+                fprintf(stderr, "invalid thread count argument\n");
+                return -1;
+            }
             break;
         case L'v':
             verbose = 1;
@@ -521,6 +786,8 @@ int main(int argc, char** argv)
             tta_mode = 1;
             break;
         case L'h':
+            print_usage();
+            return 0;
         default:
             print_usage();
             return -1;
@@ -528,7 +795,7 @@ int main(int argc, char** argv)
     }
 #else // _WIN32
     int opt;
-    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:vxh")) != -1)
+    while ((opt = getopt(argc, argv, "i:o:l:n:s:t:m:g:j:vxh")) != -1)
     {
         switch (opt)
         {
@@ -537,6 +804,9 @@ int main(int argc, char** argv)
             break;
         case 'o':
             outputpath = optarg;
+            break;
+        case 'l':
+            listpath = optarg;
             break;
         case 'n':
             noise = atoi(optarg);
@@ -554,11 +824,11 @@ int main(int argc, char** argv)
             gpuid = parse_optarg_int_array(optarg);
             break;
         case 'j':
-            sscanf(optarg, "%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
-            break;
-        case 'f':
-            format = optarg;
+            if (parse_jobs_argument(optarg, jobs_load, jobs_proc, jobs_save) != 0)
+            {
+                fprintf(stderr, "invalid thread count argument\n");
+                return -1;
+            }
             break;
         case 'v':
             verbose = 1;
@@ -567,6 +837,8 @@ int main(int argc, char** argv)
             tta_mode = 1;
             break;
         case 'h':
+            print_usage();
+            return 0;
         default:
             print_usage();
             return -1;
@@ -574,7 +846,13 @@ int main(int argc, char** argv)
     }
 #endif // _WIN32
 
-    if (inputpath.empty() || outputpath.empty())
+    if (!listpath.empty() && (!inputpath.empty() || !outputpath.empty()))
+    {
+        fprintf(stderr, "list file mode cannot be combined with -i or -o\n");
+        return -1;
+    }
+
+    if (listpath.empty() && (inputpath.empty() || outputpath.empty()))
     {
         print_usage();
         return -1;
@@ -628,33 +906,9 @@ int main(int argc, char** argv)
         }
     }
 
-    if (!path_is_directory(outputpath))
+    if (listpath.empty() && !path_is_directory(outputpath) && !is_webp_output_path(outputpath))
     {
-        // guess format from outputpath no matter what format argument specified
-        path_t ext = get_file_extension(outputpath);
-
-        if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-        {
-            format = PATHSTR("png");
-        }
-        else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-        {
-            format = PATHSTR("webp");
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-            format = PATHSTR("jpg");
-        }
-        else
-        {
-            fprintf(stderr, "invalid outputpath extension type\n");
-            return -1;
-        }
-    }
-
-    if (format != PATHSTR("png") && format != PATHSTR("webp") && format != PATHSTR("jpg"))
-    {
-        fprintf(stderr, "invalid format argument\n");
+        fprintf(stderr, "output file must use .webp\n");
         return -1;
     }
 
@@ -662,14 +916,26 @@ int main(int argc, char** argv)
     std::vector<path_t> input_files;
     std::vector<path_t> output_files;
     {
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
+        if (!listpath.empty())
+        {
+            if (load_path_list(listpath, input_files, output_files) != 0)
+                return -1;
+        }
+        else if (path_is_directory(inputpath) && path_is_directory(outputpath))
         {
             std::vector<path_t> filenames;
             int lr = list_directory(inputpath, filenames);
             if (lr != 0)
                 return -1;
 
-            const int count = filenames.size();
+            std::vector<path_t> image_filenames;
+            for (size_t i = 0; i < filenames.size(); i++)
+            {
+                if (is_supported_input_path(filenames[i]))
+                    image_filenames.push_back(filenames[i]);
+            }
+
+            const int count = (int)image_filenames.size();
             input_files.resize(count);
             output_files.resize(count);
 
@@ -677,14 +943,14 @@ int main(int argc, char** argv)
             path_t last_filename_noext;
             for (int i=0; i<count; i++)
             {
-                path_t filename = filenames[i];
+                path_t filename = image_filenames[i];
                 path_t filename_noext = get_file_name_without_extension(filename);
-                path_t output_filename = filename_noext + PATHSTR('.') + format;
+                path_t output_filename = filename_noext + PATHSTR(".webp");
 
                 // filename list is sorted, check if output image path conflicts
                 if (filename_noext == last_filename_noext)
                 {
-                    path_t output_filename2 = filename + PATHSTR('.') + format;
+                    path_t output_filename2 = filename + PATHSTR(".webp");
 #if _WIN32
                     fwprintf(stderr, L"both %ls and %ls output %ls ! %ls will output %ls\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
 #else
@@ -713,6 +979,9 @@ int main(int argc, char** argv)
             return -1;
         }
     }
+
+    if (validate_paths(input_files, output_files) != 0)
+        return -1;
 
     int prepadding = 0;
 
@@ -790,7 +1059,14 @@ int main(int argc, char** argv)
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 #endif
 
-    ncnn::create_gpu_instance();
+    bool gpu_instance_created = gpuid.empty();
+    for (size_t i = 0; i < gpuid.size(); i++)
+    {
+        if (gpuid[i] >= 0)
+            gpu_instance_created = true;
+    }
+    if (gpu_instance_created)
+        ncnn::create_gpu_instance();
 
     if (gpuid.empty())
     {
@@ -813,14 +1089,15 @@ int main(int argc, char** argv)
     jobs_load = std::min(jobs_load, cpu_count);
     jobs_save = std::min(jobs_save, cpu_count);
 
-    int gpu_count = ncnn::get_gpu_count();
+    int gpu_count = gpu_instance_created ? ncnn::get_gpu_count() : 0;
     for (int i=0; i<use_gpu_count; i++)
     {
         if (gpuid[i] < -1 || gpuid[i] >= gpu_count)
         {
             fprintf(stderr, "invalid gpu device\n");
 
-            ncnn::destroy_gpu_instance();
+            if (gpu_instance_created)
+                ncnn::destroy_gpu_instance();
             return -1;
         }
     }
@@ -855,7 +1132,7 @@ int main(int argc, char** argv)
 
         uint32_t heap_budget = ncnn::get_gpu_device(gpuid[i])->get_heap_budget();
 
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
+        if (input_files.size() > 1)
         {
             // multiple gpu jobs share the same heap
             heap_budget /= jobs_proc_per_gpu[gpuid[i]];
@@ -887,6 +1164,8 @@ int main(int argc, char** argv)
         }
     }
 
+    JobStatus job_status((int)input_files.size());
+    int model_load_failed = 0;
     {
         std::vector<Waifu2x*> waifu2x(use_gpu_count);
 
@@ -896,7 +1175,16 @@ int main(int argc, char** argv)
 
             waifu2x[i] = new Waifu2x(gpuid[i], tta_mode, num_threads);
 
-            waifu2x[i]->load(paramfullpath, modelfullpath);
+            if (waifu2x[i]->load(paramfullpath, modelfullpath) != 0)
+            {
+#if _WIN32
+                fwprintf(stderr, L"load waifu2x model failed\n");
+#else
+                fprintf(stderr, "load waifu2x model failed\n");
+#endif
+                model_load_failed = 1;
+                break;
+            }
 
             waifu2x[i]->noise = noise;
             waifu2x[i]->scale = (scale >= 2) ? 2 : scale;
@@ -905,11 +1193,13 @@ int main(int argc, char** argv)
         }
 
         // main routine
+        if (!model_load_failed)
         {
             // load image
             LoadThreadParams ltp;
             ltp.scale = scale;
             ltp.jobs_load = jobs_load;
+            ltp.status = &job_status;
             ltp.input_files = input_files;
             ltp.output_files = output_files;
 
@@ -920,6 +1210,7 @@ int main(int argc, char** argv)
             for (int i=0; i<use_gpu_count; i++)
             {
                 ptp[i].waifu2x = waifu2x[i];
+                ptp[i].status = &job_status;
             }
 
             std::vector<ncnn::Thread*> proc_threads(total_jobs_proc);
@@ -944,6 +1235,7 @@ int main(int argc, char** argv)
             // save image
             SaveThreadParams stp;
             stp.verbose = verbose;
+            stp.status = &job_status;
 
             std::vector<ncnn::Thread*> save_threads(jobs_save);
             for (int i=0; i<jobs_save; i++)
@@ -982,12 +1274,38 @@ int main(int argc, char** argv)
 
         for (int i=0; i<use_gpu_count; i++)
         {
-            delete waifu2x[i];
+            if (waifu2x[i])
+                delete waifu2x[i];
         }
         waifu2x.clear();
     }
 
-    ncnn::destroy_gpu_instance();
+    if (gpu_instance_created)
+        ncnn::destroy_gpu_instance();
 
+    if (model_load_failed)
+        return 1;
+
+    const int loaded = job_status.loaded.load();
+    const int processed = job_status.processed.load();
+    const int encoded = job_status.encoded.load();
+    const int failed = job_status.failed.load();
+    if (failed != 0 || loaded != job_status.expected || processed != job_status.expected || encoded != job_status.expected)
+    {
+#if _WIN32
+        fwprintf(stderr, L"job failed expected=%d loaded=%d processed=%d encoded=%d failed=%d\n",
+                 job_status.expected, loaded, processed, encoded, failed);
+#else
+        fprintf(stderr, "job failed expected=%d loaded=%d processed=%d encoded=%d failed=%d\n",
+                job_status.expected, loaded, processed, encoded, failed);
+#endif
+        return 1;
+    }
+
+#if _WIN32
+    fwprintf(stdout, L"completed %d images as WebP (quality=85 method=2 lossless=0 thread_level=0)\n", encoded);
+#else
+    fprintf(stdout, "completed %d images as WebP (quality=85 method=2 lossless=0 thread_level=0)\n", encoded);
+#endif
     return 0;
 }

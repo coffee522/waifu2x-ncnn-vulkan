@@ -24,6 +24,9 @@ jobs:
         mkdir build; cd build
         cmake -A x64 ../src
         cmake --build . --config Release -j 4
+    - name: smoke-test
+      run: |
+        cmake "-DWAIFU2X_EXECUTABLE=$PWD/build/Release/waifu2x-ncnn-vulkan.exe" "-DSOURCE_DIR=$PWD" "-DOUTPUT_DIR=$PWD/build/smoke" -P tests/smoke_test.cmake
 
   ubuntu:
     runs-on: ubuntu-latest
@@ -36,6 +39,9 @@ jobs:
         mkdir build && cd build
         cmake ../src
         cmake --build . -j 4
+    - name: smoke-test
+      run: |
+        cmake -DWAIFU2X_EXECUTABLE="$PWD/build/waifu2x-ncnn-vulkan" -DSOURCE_DIR="$PWD" -DOUTPUT_DIR="$PWD/build/smoke" -P tests/smoke_test.cmake
 
   macos:
     runs-on: macos-14
@@ -64,3 +70,7 @@ jobs:
             -DVulkan_LIBRARY=$GITHUB_WORKSPACE/${{ env.VULKANSDK_VERSION }}/macOS/lib/MoltenVK.xcframework/macos-arm64_x86_64/libMoltenVK.a \
             ../src
         cmake --build . -j 4
+    - name: smoke-test
+      run: |
+        if [ "$(uname -m)" = "arm64" ]; then BUILD_DIR=build-arm64; else BUILD_DIR=build-x86_64; fi
+        cmake -DWAIFU2X_EXECUTABLE="$PWD/$BUILD_DIR/waifu2x-ncnn-vulkan" -DSOURCE_DIR="$PWD" -DOUTPUT_DIR="$PWD/$BUILD_DIR/smoke" -P tests/smoke_test.cmake

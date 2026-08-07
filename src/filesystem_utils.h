@@ -35,6 +35,11 @@ static bool path_is_directory(const path_t& path)
     return (attr != INVALID_FILE_ATTRIBUTES) && (attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static bool path_exists(const path_t& path)
+{
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 static int list_directory(const path_t& dirpath, std::vector<path_t>& imagepaths)
 {
     imagepaths.clear();
@@ -67,6 +72,12 @@ static bool path_is_directory(const path_t& path)
     if (stat(path.c_str(), &s) != 0)
         return false;
     return S_ISDIR(s.st_mode);
+}
+
+static bool path_exists(const path_t& path)
+{
+    struct stat s;
+    return stat(path.c_str(), &s) == 0;
 }
 
 static int list_directory(const path_t& dirpath, std::vector<path_t>& imagepaths)
@@ -112,6 +123,23 @@ static path_t get_file_extension(const path_t& path)
         return path_t();
 
     return path.substr(dot + 1);
+}
+
+static path_t get_parent_directory(const path_t& path)
+{
+    size_t slash = path.find_last_of(PATHSTR("/\\"));
+    if (slash == path_t::npos)
+        return PATHSTR(".");
+
+    if (slash == 0)
+        return path.substr(0, 1);
+
+#if _WIN32
+    if (slash == 2 && path.size() >= 3 && path[1] == L':')
+        return path.substr(0, 3);
+#endif
+
+    return path.substr(0, slash);
 }
 
 #if _WIN32
