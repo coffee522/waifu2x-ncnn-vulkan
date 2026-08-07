@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstring>
 
 #if _WIN32
 #include <windows.h>
@@ -160,7 +161,10 @@ static path_t get_executable_directory()
     uint32_t size = sizeof(filepath);
     _NSGetExecutablePath(filepath, &size);
 
-    char* slash = strrchr(filepath, '/');
+    char* slash = std::strrchr(filepath, '/');
+    if (!slash)
+        return PATHSTR("./");
+
     slash[1] = '\0';
 
     return path_t(filepath);
@@ -168,10 +172,17 @@ static path_t get_executable_directory()
 #else
 static path_t get_executable_directory()
 {
-    char filepath[256];
-    readlink("/proc/self/exe", filepath, 256);
+    char filepath[4096];
+    ssize_t length = readlink("/proc/self/exe", filepath, sizeof(filepath) - 1);
+    if (length <= 0)
+        return PATHSTR("./");
 
-    char* slash = strrchr(filepath, '/');
+    filepath[length] = '\0';
+
+    char* slash = std::strrchr(filepath, '/');
+    if (!slash)
+        return PATHSTR("./");
+
     slash[1] = '\0';
 
     return path_t(filepath);
