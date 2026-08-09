@@ -3,6 +3,11 @@
 #include <stdio.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <cwctype>
 #include <limits.h>
 #include <queue>
 #include <set>
@@ -23,9 +28,12 @@
 #define STBI_NO_PIC
 #define STBI_NO_STDIO
 #include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 #endif // _WIN32
 #include "webp_image.h"
 #include "webp_encoder.h"
+#include "output_file.h"
 
 #if _WIN32
 #include <wchar.h>
@@ -85,6 +93,17 @@ static int parse_jobs_argument(const wchar_t* argument, int& jobs_load, std::vec
     jobs_save = _wtoi(second + 1);
     return 0;
 }
+
+static int parse_integer_argument(const wchar_t* argument, int& value)
+{
+    errno = 0;
+    wchar_t* end = 0;
+    const long parsed = wcstol(argument, &end, 10);
+    if (errno != 0 || end == argument || *end != L'\0' || parsed < INT_MIN || parsed > INT_MAX)
+        return -1;
+    value = (int)parsed;
+    return 0;
+}
 #else // _WIN32
 #include <unistd.h> // getopt()
 
@@ -116,6 +135,17 @@ static int parse_jobs_argument(const char* argument, int& jobs_load, std::vector
     jobs_save = atoi(second + 1);
     return 0;
 }
+
+static int parse_integer_argument(const char* argument, int& value)
+{
+    errno = 0;
+    char* end = 0;
+    const long parsed = strtol(argument, &end, 10);
+    if (errno != 0 || end == argument || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX)
+        return -1;
+    value = (int)parsed;
+    return 0;
+}
 #endif // _WIN32
 
 // ncnn
@@ -134,8 +164,8 @@ static void print_usage()
     fprintf(stdout, "  -h                   show this help\n");
     fprintf(stdout, "  -v                   verbose output\n");
     fprintf(stdout, "  -i input-path        input image path (jpg/png/webp) or directory\n");
-    fprintf(stdout, "  -o output-path       output WebP image path or directory\n");
-    fprintf(stdout, "  -l list-path         UTF-8 TSV with input-path<TAB>output-webp-path per line\n");
+    fprintf(stdout, "  -o output-path       output image path or directory\n");
+    fprintf(stdout, "  -l list-path         UTF-8 TSV with input-path<TAB>output-path per line\n");
     fprintf(stdout, "  -n noise-level       denoise level (-1/0/1/2/3, default=0)\n");
     fprintf(stdout, "  -s scale             upscale ratio (1/2/4/8/16/32, default=2)\n");
     fprintf(stdout, "  -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu\n");
@@ -143,7 +173,55 @@ static void print_usage()
     fprintf(stdout, "  -g gpu-id            gpu device to use (-1=cpu, default=auto) can be 0,1,2 for multi-gpu\n");
     fprintf(stdout, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stdout, "  -x                   enable tta mode\n");
-    fprintf(stdout, "\nWebP settings are fixed: quality=85 method=2 lossless=0 thread_level=0\n");
+    fprintf(stdout, "  -f format            output format (webp/png, default=webp)\n");
+    fprintf(stdout, "  -q quality           WebP quality (0-100, default=85)\n");
+    fprintf(stdout, "  -c method            WebP compression method (0-6, default=2)\n");
+    fprintf(stdout, "\nWebP lossless=0 and thread_level=0 are fixed\n");
+}
+
+enum OutputFormat
+{
+    OUTPUT_WEBP,
+    OUTPUT_PNG
+};
+
+static path_t lowercase_path(path_t value)
+{
+    for (size_t i = 0; i < value.size(); i++)
+    {
+#if _WIN32
+        value[i] = (wchar_t)towlower(value[i]);
+#else
+        value[i] = (char)tolower((unsigned char)value[i]);
+#endif
+    }
+    return value;
+}
+
+static int parse_output_format(const path_t& value, OutputFormat& format)
+{
+    const path_t normalized = lowercase_path(value);
+    if (normalized == PATHSTR("webp"))
+    {
+        format = OUTPUT_WEBP;
+        return 0;
+    }
+    if (normalized == PATHSTR("png"))
+    {
+        format = OUTPUT_PNG;
+        return 0;
+    }
+    return -1;
+}
+
+static const char* output_format_name(OutputFormat format)
+{
+    return format == OUTPUT_WEBP ? "WebP" : "PNG";
+}
+
+static path_t output_extension(OutputFormat format)
+{
+    return format == OUTPUT_WEBP ? PATHSTR("webp") : PATHSTR("png");
 }
 
 static int is_supported_input_path(const path_t& path)
@@ -155,10 +233,9 @@ static int is_supported_input_path(const path_t& path)
         || ext == PATHSTR("webp") || ext == PATHSTR("WEBP");
 }
 
-static int is_webp_output_path(const path_t& path)
+static int is_output_path(const path_t& path, OutputFormat format)
 {
-    path_t ext = get_file_extension(path);
-    return ext == PATHSTR("webp") || ext == PATHSTR("WEBP");
+    return lowercase_path(get_file_extension(path)) == output_extension(format);
 }
 
 static int utf8_to_path(const std::string& text, path_t& path)
@@ -187,7 +264,8 @@ static int utf8_to_path(const std::string& text, path_t& path)
     return 0;
 }
 
-static int load_path_list(const path_t& listpath, std::vector<path_t>& input_files, std::vector<path_t>& output_files)
+static int load_path_list(const path_t& listpath, OutputFormat format,
+                          std::vector<path_t>& input_files, std::vector<path_t>& output_files)
 {
 #if _WIN32
     FILE* fp = _wfopen(listpath.c_str(), L"rb");
@@ -266,9 +344,9 @@ static int load_path_list(const path_t& listpath, std::vector<path_t>& input_fil
                 fprintf(stderr, "unsupported input extension in list file line %d\n", line_number);
                 return -1;
             }
-            if (!is_webp_output_path(output_path))
+            if (!is_output_path(output_path, format))
             {
-                fprintf(stderr, "output path must use .webp in list file line %d\n", line_number);
+                fprintf(stderr, "output path extension does not match -f in list file line %d\n", line_number);
                 return -1;
             }
 
@@ -292,7 +370,8 @@ static int load_path_list(const path_t& listpath, std::vector<path_t>& input_fil
     return 0;
 }
 
-static int validate_paths(const std::vector<path_t>& input_files, const std::vector<path_t>& output_files)
+static int validate_paths(const std::vector<path_t>& input_files,
+                          const std::vector<path_t>& output_files, OutputFormat format)
 {
     if (input_files.empty() || input_files.size() != output_files.size())
     {
@@ -305,7 +384,7 @@ static int validate_paths(const std::vector<path_t>& input_files, const std::vec
     {
         const path_t& input_path = input_files[i];
         const path_t& output_path = output_files[i];
-        const path_t temporary_path = webp_temporary_path(output_path);
+        const path_t temporary_path = output_temporary_path(output_path);
 
         if (!is_supported_input_path(input_path) || path_is_directory(input_path) || !filepath_is_readable(input_path))
         {
@@ -316,9 +395,9 @@ static int validate_paths(const std::vector<path_t>& input_files, const std::vec
 #endif
             return -1;
         }
-        if (!is_webp_output_path(output_path))
+        if (!is_output_path(output_path, format))
         {
-            fprintf(stderr, "all output files must use .webp\n");
+            fprintf(stderr, "all output file extensions must match -f\n");
             return -1;
         }
         if (!path_is_directory(get_parent_directory(output_path)))
@@ -672,7 +751,50 @@ class SaveThreadParams
 public:
     int verbose;
     JobStatus* status;
+    OutputFormat output_format;
+    WebPOptions webp;
 };
+
+static bool encode_png_file(const path_t& output_path, int width, int height, int channels,
+                            const unsigned char* pixels, std::string& error)
+{
+    error.clear();
+    if (!pixels)
+    {
+        error = "pixel buffer is null";
+        return false;
+    }
+    if (width <= 0 || height <= 0 || (channels != 3 && channels != 4))
+    {
+        error = "invalid PNG dimensions or channel count";
+        return false;
+    }
+
+    FILE* reservation = create_temporary_output(output_path, error);
+    if (!reservation)
+        return false;
+    if (fclose(reservation) != 0)
+    {
+        discard_temporary_output(output_path);
+        error = "closing reserved temporary output failed";
+        return false;
+    }
+
+    const path_t temporary_path = output_temporary_path(output_path);
+#if _WIN32
+    const int encoded = wic_encode_image(temporary_path.c_str(), width, height, channels, (void*)pixels);
+#else
+    const int encoded = stbi_write_png(temporary_path.c_str(), width, height, channels,
+                                       pixels, width * channels);
+#endif
+    if (!encoded)
+    {
+        discard_temporary_output(output_path);
+        error = "PNG encoder failed";
+        return false;
+    }
+    return commit_temporary_output(output_path, error);
+}
 
 void* save(void* args)
 {
@@ -690,8 +812,19 @@ void* save(void* args)
             break;
 
         std::string error;
-        bool success = encode_webp_file(v.outpath, v.outimage.w, v.outimage.h,
-                                        v.outimage.elempack, (const unsigned char*)v.outimage.data, error);
+        bool success = false;
+        if (stp->output_format == OUTPUT_WEBP)
+        {
+            success = encode_webp_file(v.outpath, v.outimage.w, v.outimage.h,
+                                       v.outimage.elempack, (const unsigned char*)v.outimage.data,
+                                       stp->webp, error);
+        }
+        else
+        {
+            success = encode_png_file(v.outpath, v.outimage.w, v.outimage.h,
+                                      v.outimage.elempack, (const unsigned char*)v.outimage.data,
+                                      error);
+        }
         release_input_pixels(v);
 
         if (success)
@@ -740,11 +873,15 @@ int main(int argc, char** argv)
     int jobs_save = 2;
     int verbose = 0;
     int tta_mode = 0;
+    OutputFormat output_format = OUTPUT_WEBP;
+    WebPOptions webp_options = {85.f, 2};
+    bool webp_quality_specified = false;
+    bool webp_method_specified = false;
 
 #if _WIN32
     setlocale(LC_ALL, "");
     wchar_t opt;
-    while ((opt = getopt(argc, argv, L"i:o:l:n:s:t:m:g:j:vxh")) != (wchar_t)-1)
+    while ((opt = getopt(argc, argv, L"i:o:l:n:s:t:m:g:j:f:q:c:vxh")) != (wchar_t)-1)
     {
         switch (opt)
         {
@@ -779,6 +916,33 @@ int main(int argc, char** argv)
                 return -1;
             }
             break;
+        case L'f':
+            if (parse_output_format(path_t(optarg), output_format) != 0)
+            {
+                fprintf(stderr, "invalid output format; expected webp or png\n");
+                return -1;
+            }
+            break;
+        case L'q':
+        {
+            int quality = 0;
+            if (parse_integer_argument(optarg, quality) != 0)
+            {
+                fprintf(stderr, "invalid WebP quality argument\n");
+                return -1;
+            }
+            webp_options.quality = (float)quality;
+            webp_quality_specified = true;
+            break;
+        }
+        case L'c':
+            if (parse_integer_argument(optarg, webp_options.method) != 0)
+            {
+                fprintf(stderr, "invalid WebP method argument\n");
+                return -1;
+            }
+            webp_method_specified = true;
+            break;
         case L'v':
             verbose = 1;
             break;
@@ -795,7 +959,7 @@ int main(int argc, char** argv)
     }
 #else // _WIN32
     int opt;
-    while ((opt = getopt(argc, argv, "i:o:l:n:s:t:m:g:j:vxh")) != -1)
+    while ((opt = getopt(argc, argv, "i:o:l:n:s:t:m:g:j:f:q:c:vxh")) != -1)
     {
         switch (opt)
         {
@@ -829,6 +993,33 @@ int main(int argc, char** argv)
                 fprintf(stderr, "invalid thread count argument\n");
                 return -1;
             }
+            break;
+        case 'f':
+            if (parse_output_format(path_t(optarg), output_format) != 0)
+            {
+                fprintf(stderr, "invalid output format; expected webp or png\n");
+                return -1;
+            }
+            break;
+        case 'q':
+        {
+            int quality = 0;
+            if (parse_integer_argument(optarg, quality) != 0)
+            {
+                fprintf(stderr, "invalid WebP quality argument\n");
+                return -1;
+            }
+            webp_options.quality = (float)quality;
+            webp_quality_specified = true;
+            break;
+        }
+        case 'c':
+            if (parse_integer_argument(optarg, webp_options.method) != 0)
+            {
+                fprintf(stderr, "invalid WebP method argument\n");
+                return -1;
+            }
+            webp_method_specified = true;
             break;
         case 'v':
             verbose = 1;
@@ -906,9 +1097,25 @@ int main(int argc, char** argv)
         }
     }
 
-    if (listpath.empty() && !path_is_directory(outputpath) && !is_webp_output_path(outputpath))
+    if (webp_options.quality < 0.f || webp_options.quality > 100.f)
     {
-        fprintf(stderr, "output file must use .webp\n");
+        fprintf(stderr, "WebP quality must be between 0 and 100\n");
+        return -1;
+    }
+    if (webp_options.method < 0 || webp_options.method > 6)
+    {
+        fprintf(stderr, "WebP method must be between 0 and 6\n");
+        return -1;
+    }
+    if (output_format == OUTPUT_PNG && (webp_quality_specified || webp_method_specified))
+    {
+        fprintf(stderr, "-q and -c are only valid with -f webp\n");
+        return -1;
+    }
+
+    if (listpath.empty() && !path_is_directory(outputpath) && !is_output_path(outputpath, output_format))
+    {
+        fprintf(stderr, "output file extension must match -f\n");
         return -1;
     }
 
@@ -918,7 +1125,7 @@ int main(int argc, char** argv)
     {
         if (!listpath.empty())
         {
-            if (load_path_list(listpath, input_files, output_files) != 0)
+            if (load_path_list(listpath, output_format, input_files, output_files) != 0)
                 return -1;
         }
         else if (path_is_directory(inputpath) && path_is_directory(outputpath))
@@ -945,12 +1152,12 @@ int main(int argc, char** argv)
             {
                 path_t filename = image_filenames[i];
                 path_t filename_noext = get_file_name_without_extension(filename);
-                path_t output_filename = filename_noext + PATHSTR(".webp");
+                path_t output_filename = filename_noext + PATHSTR(".") + output_extension(output_format);
 
                 // filename list is sorted, check if output image path conflicts
                 if (filename_noext == last_filename_noext)
                 {
-                    path_t output_filename2 = filename + PATHSTR(".webp");
+                    path_t output_filename2 = filename + PATHSTR(".") + output_extension(output_format);
 #if _WIN32
                     fwprintf(stderr, L"both %ls and %ls output %ls ! %ls will output %ls\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
 #else
@@ -980,7 +1187,7 @@ int main(int argc, char** argv)
         }
     }
 
-    if (validate_paths(input_files, output_files) != 0)
+    if (validate_paths(input_files, output_files, output_format) != 0)
         return -1;
 
     int prepadding = 0;
@@ -1236,6 +1443,8 @@ int main(int argc, char** argv)
             SaveThreadParams stp;
             stp.verbose = verbose;
             stp.status = &job_status;
+            stp.output_format = output_format;
+            stp.webp = webp_options;
 
             std::vector<ncnn::Thread*> save_threads(jobs_save);
             for (int i=0; i<jobs_save; i++)
@@ -1302,10 +1511,14 @@ int main(int argc, char** argv)
         return 1;
     }
 
-#if _WIN32
-    fwprintf(stdout, L"completed %d images as WebP (quality=85 method=2 lossless=0 thread_level=0)\n", encoded);
-#else
-    fprintf(stdout, "completed %d images as WebP (quality=85 method=2 lossless=0 thread_level=0)\n", encoded);
-#endif
+    if (output_format == OUTPUT_WEBP)
+    {
+        fprintf(stdout, "completed %d images as %s (quality=%.0f method=%d lossless=0 thread_level=0)\n",
+                encoded, output_format_name(output_format), webp_options.quality, webp_options.method);
+    }
+    else
+    {
+        fprintf(stdout, "completed %d images as %s\n", encoded, output_format_name(output_format));
+    }
     return 0;
 }

@@ -277,7 +277,7 @@ if(MINGW)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -municode")
 endif()
 
-add_executable(waifu2x-ncnn-vulkan main.cpp waifu2x.cpp webp_encoder.cpp)
+add_executable(waifu2x-ncnn-vulkan main.cpp waifu2x.cpp webp_encoder.cpp output_file.cpp)
 
 add_dependencies(waifu2x-ncnn-vulkan generate-spirv)
 

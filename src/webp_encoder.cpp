@@ -1,9 +1,8 @@
 #include "webp_encoder.h"
 
-#include <errno.h>
 #include <stdio.h>
-#include <string.h>
 
+#include "output_file.h"
 #include "webp/encode.h"
 
 namespace
@@ -54,57 +53,11 @@ static const char* encoding_error_message(WebPEncodingError error)
     }
 }
 
-static FILE* open_output(const path_t& path)
-{
-#if _WIN32
-    FILE* file = 0;
-    if (_wfopen_s(&file, path.c_str(), L"wbx") != 0)
-        return 0;
-    return file;
-#else
-    return fopen(path.c_str(), "wbx");
-#endif
-}
-
-static std::string errno_message()
-{
-#if _WIN32
-    char buffer[256];
-    if (strerror_s(buffer, sizeof(buffer), errno) == 0)
-        return buffer;
-    return "unknown system error";
-#else
-    return strerror(errno);
-#endif
-}
-
-static int remove_output(const path_t& path)
-{
-#if _WIN32
-    return _wremove(path.c_str());
-#else
-    return remove(path.c_str());
-#endif
-}
-
-static int rename_output(const path_t& source, const path_t& destination)
-{
-#if _WIN32
-    return _wrename(source.c_str(), destination.c_str());
-#else
-    return rename(source.c_str(), destination.c_str());
-#endif
-}
-
 } // namespace
 
-path_t webp_temporary_path(const path_t& output_path)
-{
-    return output_path + PATHSTR(".tmp");
-}
-
 bool encode_webp_file(const path_t& output_path, int width, int height, int channels,
-                      const unsigned char* pixels, std::string& error)
+                      const unsigned char* pixels, const WebPOptions& options,
+                      std::string& error)
 {
     error.clear();
 
@@ -131,8 +84,8 @@ bool encode_webp_file(const path_t& output_path, int width, int height, int chan
         return false;
     }
     config.lossless = 0;
-    config.quality = 85.f;
-    config.method = 2;
+    config.quality = options.quality;
+    config.method = options.method;
     config.thread_level = 0;
     if (!WebPValidateConfig(&config))
     {
@@ -170,12 +123,10 @@ bool encode_webp_file(const path_t& output_path, int width, int height, int chan
         return false;
     }
 
-    const path_t temporary_path = webp_temporary_path(output_path);
-    FILE* file = open_output(temporary_path);
+    FILE* file = create_temporary_output(output_path, error);
     if (!file)
     {
         WebPPictureFree(&picture);
-        error = std::string("cannot exclusively create temporary output: ") + errno_message();
         return false;
     }
 
@@ -204,22 +155,8 @@ bool encode_webp_file(const path_t& output_path, int width, int height, int chan
 
     if (!success)
     {
-        remove_output(temporary_path);
+        discard_temporary_output(output_path);
         return false;
     }
-
-    if (path_exists(output_path))
-    {
-        remove_output(temporary_path);
-        error = "final output already exists";
-        return false;
-    }
-    if (rename_output(temporary_path, output_path) != 0)
-    {
-        error = std::string("committing temporary output failed: ") + errno_message();
-        remove_output(temporary_path);
-        return false;
-    }
-
-    return true;
+    return commit_temporary_output(output_path, error);
 }
