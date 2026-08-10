@@ -57,7 +57,7 @@ WebP lossless=0 and thread_level=0 are fixed
 - `-q` and `-c` are accepted only for WebP. PNG uses the platform PNG encoder and has no configurable encoder parameters.
 - Directory mode processes supported images directly inside one directory. Use list mode to process nested directory trees in one process.
 - `list-path` is UTF-8 TSV with one input and output path separated by a tab per line. Empty lines and lines beginning with `#` are ignored.
-- Output parent directories must already exist. Final output files and their `.tmp` paths must not exist before the job starts.
+- Output parent directories must already exist. Existing final images are replaced atomically only after the new image is encoded successfully. A pre-existing `.tmp` path is rejected because it may belong to an interrupted or active process.
 - `noise-level` = noise level, large value means strong denoise effect, -1 = no effect
 - `scale` = scale level, 1 = no scaling, 2 = upscale 2x
 - `tile-size` = tile size, use smaller value to reduce GPU memory usage, default selects automatically

@@ -204,12 +204,49 @@ execute_process(
     OUTPUT_VARIABLE OVERWRITE_STDOUT
     ERROR_VARIABLE OVERWRITE_STDERR
 )
-if(OVERWRITE_RESULT STREQUAL "0")
-    message(FATAL_ERROR "existing outputs were unexpectedly overwritten")
+if(NOT OVERWRITE_RESULT STREQUAL "0")
+    message(FATAL_ERROR "existing WebP outputs were not overwritten (${OVERWRITE_RESULT})\nstdout:\n${OVERWRITE_STDOUT}\nstderr:\n${OVERWRITE_STDERR}")
 endif()
 if(EXISTS "${OUTPUT_PATH}.tmp" OR EXISTS "${UNICODE_OUTPUT_PATH}.tmp")
-    message(FATAL_ERROR "overwrite rejection left temporary outputs")
+    message(FATAL_ERROR "WebP overwrite left temporary outputs")
 endif()
+assert_webp("${OUTPUT_PATH}")
+assert_webp("${UNICODE_OUTPUT_PATH}")
+
+execute_process(
+    COMMAND "${WAIFU2X_EXECUTABLE}"
+        -l "${PNG_LIST_PATH}"
+        -f png
+        -n 0
+        -s 1
+        -g -1
+        -j "1:1:1"
+        -m "${MODEL_PATH}"
+    RESULT_VARIABLE PNG_OVERWRITE_RESULT
+    OUTPUT_VARIABLE PNG_OVERWRITE_STDOUT
+    ERROR_VARIABLE PNG_OVERWRITE_STDERR
+)
+if(NOT PNG_OVERWRITE_RESULT STREQUAL "0")
+    message(FATAL_ERROR "existing PNG output was not overwritten (${PNG_OVERWRITE_RESULT})\nstdout:\n${PNG_OVERWRITE_STDOUT}\nstderr:\n${PNG_OVERWRITE_STDERR}")
+endif()
+assert_png("${PNG_OUTPUT_PATH}")
+
+file(WRITE "${INVALID_OUTPUT_PATH}.tmp" "stale temporary output")
+file(WRITE "${INVALID_LIST_PATH}" "${INPUT_PATH}\t${INVALID_OUTPUT_PATH}\n")
+execute_process(
+    COMMAND "${WAIFU2X_EXECUTABLE}" -l "${INVALID_LIST_PATH}" -g -1 -m "${MODEL_PATH}"
+    RESULT_VARIABLE STALE_TEMP_RESULT
+)
+if(STALE_TEMP_RESULT STREQUAL "0")
+    message(FATAL_ERROR "pre-existing temporary output unexpectedly succeeded")
+endif()
+if(NOT EXISTS "${INVALID_OUTPUT_PATH}.tmp")
+    message(FATAL_ERROR "pre-existing temporary output was unexpectedly removed")
+endif()
+if(EXISTS "${INVALID_OUTPUT_PATH}")
+    message(FATAL_ERROR "pre-existing temporary output test created a final output")
+endif()
+file(REMOVE "${INVALID_OUTPUT_PATH}.tmp")
 
 file(WRITE "${INVALID_LIST_PATH}" "${SOURCE_DIR}/images/missing.png\t${INVALID_OUTPUT_PATH}\n")
 execute_process(
@@ -226,6 +263,7 @@ if(EXISTS "${INVALID_OUTPUT_PATH}" OR EXISTS "${INVALID_OUTPUT_PATH}.tmp")
 endif()
 
 file(WRITE "${CORRUPT_INPUT_PATH}" "this is not a PNG image")
+configure_file("${OUTPUT_PATH}" "${CORRUPT_OUTPUT_PATH}" COPYONLY)
 file(WRITE "${CORRUPT_LIST_PATH}" "${CORRUPT_INPUT_PATH}\t${CORRUPT_OUTPUT_PATH}\n")
 execute_process(
     COMMAND "${WAIFU2X_EXECUTABLE}"
@@ -242,8 +280,9 @@ execute_process(
 if(CORRUPT_RESULT STREQUAL "0")
     message(FATAL_ERROR "corrupt image job unexpectedly succeeded")
 endif()
-if(EXISTS "${CORRUPT_OUTPUT_PATH}" OR EXISTS "${CORRUPT_OUTPUT_PATH}.tmp")
-    message(FATAL_ERROR "corrupt image job created output files")
+if(EXISTS "${CORRUPT_OUTPUT_PATH}.tmp")
+    message(FATAL_ERROR "corrupt image job left a temporary output")
 endif()
+assert_webp("${CORRUPT_OUTPUT_PATH}")
 
 message(STATUS "waifu2x smoke test passed\n${STDOUT}")

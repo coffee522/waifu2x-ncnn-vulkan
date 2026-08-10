@@ -3,6 +3,10 @@
 #include <errno.h>
 #include <string.h>
 
+#if _WIN32
+#include <windows.h>
+#endif
+
 namespace
 {
 
@@ -27,13 +31,20 @@ static int remove_path(const path_t& path)
 #endif
 }
 
-static int rename_path(const path_t& source, const path_t& destination)
+static bool replace_path(const path_t& source, const path_t& destination, std::string& error)
 {
 #if _WIN32
-    return _wrename(source.c_str(), destination.c_str());
+    if (MoveFileExW(source.c_str(), destination.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return true;
+    error = "committing temporary output failed: Windows error "
+        + std::to_string((unsigned long)GetLastError());
 #else
-    return rename(source.c_str(), destination.c_str());
+    if (rename(source.c_str(), destination.c_str()) == 0)
+        return true;
+    error = std::string("committing temporary output failed: ") + errno_message();
 #endif
+    return false;
 }
 
 } // namespace
@@ -62,15 +73,8 @@ FILE* create_temporary_output(const path_t& output_path, std::string& error)
 bool commit_temporary_output(const path_t& output_path, std::string& error)
 {
     const path_t temporary_path = output_temporary_path(output_path);
-    if (path_exists(output_path))
+    if (!replace_path(temporary_path, output_path, error))
     {
-        discard_temporary_output(output_path);
-        error = "final output already exists";
-        return false;
-    }
-    if (rename_path(temporary_path, output_path) != 0)
-    {
-        error = std::string("committing temporary output failed: ") + errno_message();
         discard_temporary_output(output_path);
         return false;
     }

@@ -409,12 +409,12 @@ static int validate_paths(const std::vector<path_t>& input_files,
 #endif
             return -1;
         }
-        if (path_exists(output_path) || path_exists(temporary_path))
+        if (path_exists(temporary_path))
         {
 #if _WIN32
-            fwprintf(stderr, L"output or temporary output already exists: %ls\n", output_path.c_str());
+            fwprintf(stderr, L"temporary output already exists: %ls\n", temporary_path.c_str());
 #else
-            fprintf(stderr, "output or temporary output already exists: %s\n", output_path.c_str());
+            fprintf(stderr, "temporary output already exists: %s\n", temporary_path.c_str());
 #endif
             return -1;
         }
