@@ -224,5 +224,6 @@ jobs:
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         tag_name: ${{ needs.setup.outputs.VERSION }}
+        target_commitish: ${{ github.sha }}
         name: Release ${{ needs.setup.outputs.VERSION }}
         files: artifacts/*/*.zip
